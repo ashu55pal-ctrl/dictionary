@@ -83,6 +83,75 @@ menu = st.sidebar.selectbox("Navigation", ["Daily Quiz", "Progress Dashboard"])
 if menu == "Daily Quiz":
     st.header("Adaptive Vocabulary Quiz")
     
+    # --- AUTOMATIC PDF IMPORTER ---
+    with st.expander("➕ Upload New PDF Vocabulary"):
+        st.write("Upload a PDF table to automatically extract and add new words to your database.")
+        uploaded_pdf = st.file_uploader("Choose a PDF file", type="pdf")
+        
+        if uploaded_pdf is not None:
+            if st.button("Extract & Add Words"):
+                import pdfplumber
+                import re
+                
+                with st.spinner("Reading PDF and updating database..."):
+                    vocab_ref = db.collection("vocabulary_master")
+                    added_count = 0
+                    
+                    # Read the PDF directly from the uploaded file in Streamlit
+                    with pdfplumber.open(uploaded_pdf) as pdf:
+                        for page in pdf.pages:
+                            table = page.extract_table()
+                            if not table:
+                                continue
+                                
+                            for row in table[1:]: # Skip header rows
+                                if not row or len(row) < 3:
+                                    continue
+                                    
+                                word_pos = str(row[1]).strip()
+                                meaning = str(row[2]).strip()
+                                
+                                if not word_pos or word_pos == "Word (POS)":
+                                    continue
+                                    
+                                # Clean the word and identify the Category
+                                word_clean = word_pos
+                                category = "Vocabulary"
+                                match = re.search(r'([A-Za-z\-]+)\s*\((.*?)\)', word_pos.replace('\n', ' '))
+                                
+                                if match:
+                                    word_clean = match.group(1).strip()
+                                    pos_tag = match.group(2).strip().upper()
+                                    if 'V' in pos_tag: category = 'Verb'
+                                    elif 'N' in pos_tag: category = 'Noun'
+                                    elif 'ADJ' in pos_tag: category = 'Adjective'
+                                    elif 'ADV' in pos_tag: category = 'Adverb'
+
+                                clean_definition = meaning.replace('\n', ' ').strip()
+                                
+                                # Check database and add if it is a new word
+                                doc_ref = vocab_ref.document(word_clean)
+                                if not doc_ref.get().exists:
+                                    doc_ref.set({
+                                        'word_text': word_clean,
+                                        'definition': clean_definition,
+                                        'hindi_meaning': '',
+                                        'category': category,
+                                        'repeat_count': 0,
+                                        'correct_attempts': 0,
+                                        'total_attempts': 0
+                                    })
+                                    added_count += 1
+                                    
+                    st.success(f"✅ Success! {added_count} new words have been permanently added to your quiz pool.")
+    # --- END OF IMPORTER ---
+    
+    if 'current_q' not in st.session_state:
+        st.session_state.current_q, st.session_state.options = get_quiz_question()
+        st.session_state.answered = False
+        
+    # ... (Keep the rest of your Daily Quiz code here)
+    
     if 'current_q' not in st.session_state:
         st.session_state.current_q, st.session_state.options = get_quiz_question()
         st.session_state.answered = False
@@ -134,4 +203,5 @@ elif menu == "Progress Dashboard":
         
         st.dataframe(df[['word_text', 'category', 'repeat_count', 'Success Rate (%)']].sort_values(by='Success Rate (%)'))
     else:
+
         st.write("Database is empty.")
