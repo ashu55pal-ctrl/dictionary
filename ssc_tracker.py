@@ -3,205 +3,207 @@ from google.cloud import firestore
 import random
 import pandas as pd
 import json
+import re
 
-# --- 1. Database Setup (Firebase) ---
-# Authenticate to Firestore using the JSON account key stored in Streamlit Secrets
+# --- 1. Database Setup ---
 key_dict = json.loads(st.secrets["textkey"])
 db = firestore.Client.from_service_account_info(key_dict)
 
-def init_db():
-    # Firestore doesn't need table creation, but we can seed starter data if empty
-    vocab_ref = db.collection("vocabulary_master")
-    
-    # Check if we already have data
-    if len(list(vocab_ref.limit(1).stream())) == 0:
-        starter_data = [
-            {'word_text': 'Dermatologist', 'definition': 'A doctor who studies skin diseases', 'hindi_meaning': 'त्वचा विशेषज्ञ', 'category': 'OWS', 'repeat_count': 3, 'correct_attempts': 0, 'total_attempts': 0},
-            {'word_text': 'Derelict', 'definition': 'A person without a home or property', 'hindi_meaning': 'आवारा व्यक्ति', 'category': 'OWS', 'repeat_count': 2, 'correct_attempts': 0, 'total_attempts': 0},
-            {'word_text': 'Dexterous', 'definition': 'Skillful with your hands', 'hindi_meaning': 'निपुण', 'category': 'OWS', 'repeat_count': 2, 'correct_attempts': 0, 'total_attempts': 0}
-        ]
-        
-        for data in starter_data:
-            # Using the word itself as the document ID for easy lookup
-            vocab_ref.document(data['word_text']).set(data)
+def fetch_all_words():
+    docs = db.collection("vocabulary_master").stream()
+    words = [doc.to_dict() for doc in docs]
+    # Sort alphabetically
+    return sorted(words, key=lambda x: x['word_text'].lower())
 
-# --- 2. Fetching Quiz Data ---
-def get_quiz_question():
-    vocab_ref = db.collection("vocabulary_master")
-    docs = list(vocab_ref.stream())
-    
-    if not docs:
-        return None, []
-        
-    vocab_list = [doc.to_dict() for doc in docs]
-    
-    # Sort to find the weakest / most repeated word
-    def sort_key(x):
-        total = x.get('total_attempts', 0)
-        success_rate = (x.get('correct_attempts', 0) / total) if total > 0 else 0
-        return (success_rate, -x.get('repeat_count', 0))
-        
-    vocab_list.sort(key=sort_key)
-    target_word = vocab_list[0]
-    
-    # Get 3 decoys from the same category
-    same_category = [w['word_text'] for w in vocab_list if w['category'] == target_word['category'] and w['word_text'] != target_word['word_text']]
-    decoys = random.sample(same_category, min(len(same_category), 3))
-    
-    while len(decoys) < 3:
-        decoys.append("Placeholder Decoy")
-        
-    options = decoys + [target_word['word_text']]
-    random.shuffle(options)
-    
-    return target_word, options
-
-# --- 3. Update Performance ---
-def update_score(word_text, is_correct):
+def update_score(word_text, is_correct, quiz_type):
     doc_ref = db.collection("vocabulary_master").document(word_text)
-    
-    # Using a transaction or simple get/set to increment
     doc = doc_ref.get()
     if doc.exists:
         data = doc.to_dict()
         new_total = data.get('total_attempts', 0) + 1
         new_correct = data.get('correct_attempts', 0) + (1 if is_correct else 0)
         
+        # Track which quiz type was attempted to mark sets as completed
+        attempted_key = f"{quiz_type}_attempted"
+        
         doc_ref.update({
             'total_attempts': new_total,
-            'correct_attempts': new_correct
+            'correct_attempts': new_correct,
+            attempted_key: True
         })
 
-# --- 4. Streamlit UI ---
-st.set_page_config(page_title="SSC CGL Vocab Tracker", layout="centered")
-init_db()
+# --- 2. Custom Interactive Buttons (Red/Green Logic) ---
+def render_quiz_options(options, correct_option, word_text, quiz_type):
+    if st.session_state.get('answered', False):
+        for opt in options:
+            if opt == correct_option:
+                # Highlight correct answer in Green
+                st.markdown(f"<div style='background-color: #d4edda; color: #155724; padding: 15px; border-radius: 8px; border: 1px solid #c3e6cb; margin-bottom: 10px; font-weight: bold;'>✅ {opt}</div>", unsafe_allow_html=True)
+            elif opt == st.session_state.selected_option:
+                # Highlight chosen wrong answer in Red
+                st.markdown(f"<div style='background-color: #f8d7da; color: #721c24; padding: 15px; border-radius: 8px; border: 1px solid #f5c6cb; margin-bottom: 10px;'>❌ {opt}</div>", unsafe_allow_html=True)
+            else:
+                # Neutral for unselected wrong answers
+                st.markdown(f"<div style='background-color: #f8f9fa; color: #6c757d; padding: 15px; border-radius: 8px; border: 1px solid #dee2e6; margin-bottom: 10px;'>{opt}</div>", unsafe_allow_html=True)
+        
+        if st.button("Next Question ➡️"):
+            st.session_state.current_index += 1
+            st.session_state.answered = False
+            st.session_state.selected_option = None
+            st.rerun()
+    else:
+        for opt in options:
+            if st.button(opt, key=opt, use_container_width=True):
+                st.session_state.answered = True
+                st.session_state.selected_option = opt
+                is_correct = (opt == correct_option)
+                update_score(word_text, is_correct, quiz_type)
+                st.rerun()
 
+# --- 3. Streamlit UI & Navigation ---
+st.set_page_config(page_title="SSC CGL Vocab Tracker", layout="centered")
 st.title("📚 SSC CGL Tracker - Target: May 31")
 
-menu = st.sidebar.selectbox("Navigation", ["Daily Quiz", "Progress Dashboard"])
+menu = st.sidebar.selectbox("Navigation", ["Home / Upload PDF", "OWS Quiz (Sets of 25)", "Synonym Quiz (Sets of 25)"])
 
-if menu == "Daily Quiz":
-    st.header("Adaptive Vocabulary Quiz")
+# ----------------------------------------
+# TAB 1: UPLOAD & PDF EXTRACTION
+# ----------------------------------------
+if menu == "Home / Upload PDF":
+    st.header("📥 Smart PDF Uploader")
+    st.write("Upload a PDF table. The program will automatically separate Synonyms from the English Meaning and add them to your database alphabetically.")
     
-    # --- AUTOMATIC PDF IMPORTER ---
-    with st.expander("➕ Upload New PDF Vocabulary"):
-        st.write("Upload a PDF table to automatically extract and add new words to your database.")
-        uploaded_pdf = st.file_uploader("Choose a PDF file", type="pdf")
-        
-        if uploaded_pdf is not None:
-            if st.button("Extract & Add Words"):
-                import pdfplumber
-                import re
+    uploaded_pdf = st.file_uploader("Choose a PDF file", type="pdf")
+    
+    if uploaded_pdf is not None:
+        if st.button("Extract & Add Words"):
+            import pdfplumber
+            with st.spinner("Extracting meanings and synonyms..."):
+                vocab_ref = db.collection("vocabulary_master")
+                added_count = 0
                 
-                with st.spinner("Reading PDF and updating database..."):
-                    vocab_ref = db.collection("vocabulary_master")
-                    added_count = 0
-                    
-                    # Read the PDF directly from the uploaded file in Streamlit
-                    with pdfplumber.open(uploaded_pdf) as pdf:
-                        for page in pdf.pages:
-                            table = page.extract_table()
-                            if not table:
-                                continue
+                with pdfplumber.open(uploaded_pdf) as pdf:
+                    for page in pdf.pages:
+                        table = page.extract_table()
+                        if not table: continue
+                            
+                        for row in table[1:]:
+                            if not row or len(row) < 3: continue
                                 
-                            for row in table[1:]: # Skip header rows
-                                if not row or len(row) < 3:
-                                    continue
-                                    
-                                word_pos = str(row[1]).strip()
-                                meaning = str(row[2]).strip()
+                            word_raw = str(row[1]).strip()
+                            meaning_raw = str(row[2]).strip()
+                            
+                            if not word_raw or word_raw == "Word (POS)": continue
                                 
-                                if not word_pos or word_pos == "Word (POS)":
-                                    continue
-                                    
-                                # Clean the word and identify the Category
-                                word_clean = word_pos
-                                category = "Vocabulary"
-                                match = re.search(r'([A-Za-z\-]+)\s*\((.*?)\)', word_pos.replace('\n', ' '))
+                            # 1. Clean the Word
+                            word_clean = word_raw.split('(')[0].strip()
+                            
+                            # 2. Split Synonyms and English Meaning
+                            # In your PDF, they are separated by a newline
+                            parts = meaning_raw.split('\n')
+                            if len(parts) >= 2:
+                                synonyms_text = parts[0].strip()
+                                english_meaning_text = " ".join(parts[1:]).strip()
+                            else:
+                                synonyms_text = "No synonyms provided"
+                                english_meaning_text = meaning_raw.strip()
+                            
+                            doc_ref = vocab_ref.document(word_clean)
+                            if not doc_ref.get().exists:
+                                doc_ref.set({
+                                    'word_text': word_clean,
+                                    'english_meaning': english_meaning_text,
+                                    'synonyms': synonyms_text,
+                                    'correct_attempts': 0,
+                                    'total_attempts': 0,
+                                    'ows_attempted': False,
+                                    'syno_attempted': False
+                                })
+                                added_count += 1
                                 
-                                if match:
-                                    word_clean = match.group(1).strip()
-                                    pos_tag = match.group(2).strip().upper()
-                                    if 'V' in pos_tag: category = 'Verb'
-                                    elif 'N' in pos_tag: category = 'Noun'
-                                    elif 'ADJ' in pos_tag: category = 'Adjective'
-                                    elif 'ADV' in pos_tag: category = 'Adverb'
+                st.success(f"✅ Success! {added_count} new words added to your quiz database.")
 
-                                clean_definition = meaning.replace('\n', ' ').strip()
-                                
-                                # Check database and add if it is a new word
-                                doc_ref = vocab_ref.document(word_clean)
-                                if not doc_ref.get().exists:
-                                    doc_ref.set({
-                                        'word_text': word_clean,
-                                        'definition': clean_definition,
-                                        'hindi_meaning': '',
-                                        'category': category,
-                                        'repeat_count': 0,
-                                        'correct_attempts': 0,
-                                        'total_attempts': 0
-                                    })
-                                    added_count += 1
-                                    
-                    st.success(f"✅ Success! {added_count} new words have been permanently added to your quiz pool.")
-    # --- END OF IMPORTER ---
+# ----------------------------------------
+# TAB 2 & 3: QUIZ LOGIC (OWS & SYNONYMS)
+# ----------------------------------------
+elif menu in ["OWS Quiz (Sets of 25)", "Synonym Quiz (Sets of 25)"]:
+    quiz_type = "ows" if "OWS" in menu else "syno"
+    st.header(f"🧠 {menu.split(' ')[0]} Practice")
     
-    if 'current_q' not in st.session_state:
-        st.session_state.current_q, st.session_state.options = get_quiz_question()
-        st.session_state.answered = False
-        
-    # ... (Keep the rest of your Daily Quiz code here)
+    all_words = fetch_all_words()
     
-    if 'current_q' not in st.session_state:
-        st.session_state.current_q, st.session_state.options = get_quiz_question()
-        st.session_state.answered = False
-
-    if st.session_state.current_q:
-        q_data = st.session_state.current_q
+    if not all_words:
+        st.warning("Your database is empty. Please upload a PDF first.")
+    else:
+        # Chunk into sets of 25
+        sets = [all_words[i:i + 25] for i in range(0, len(all_words), 25)]
         
-        st.markdown(f"**Category:** {q_data['category']}")
-        st.subheader("What is the single word for:")
-        st.info(f"*{q_data['definition']}*")
+        # Create user-friendly labels for the dropdown
+        set_options = {}
+        for i, s in enumerate(sets):
+            start_word = s[0]['word_text']
+            end_word = s[-1]['word_text']
+            
+            # Check if all words in this set have been attempted
+            is_attempted = all(w.get(f'{quiz_type}_attempted', False) for w in s)
+            status = "✅ Attempted" if is_attempted else "⏳ Pending"
+            
+            label = f"Set {i+1}: {start_word} to {end_word} [{status}]"
+            set_options[label] = s
+            
+        selected_set_label = st.selectbox("Choose a Practice Set:", list(set_options.keys()))
+        current_set = set_options[selected_set_label]
         
-        with st.expander("Show Hindi Hint"):
-            st.write(q_data.get('hindi_meaning', 'No hint available'))
-
-        choice = st.radio("Select the correct word:", st.session_state.options, index=None, disabled=st.session_state.answered)
-        
-        if st.button("Submit Answer", disabled=st.session_state.answered):
-            if choice:
-                st.session_state.answered = True
-                if choice == q_data['word_text']:
-                    st.success(f"Correct! ✅")
-                    update_score(q_data['word_text'], True)
-                else:
-                    st.error(f"Incorrect. ❌ The correct word was **{q_data['word_text']}**.")
-                    update_score(q_data['word_text'], False)
-                st.rerun()
+        # Quiz initialization
+        if 'active_set_label' not in st.session_state or st.session_state.active_set_label != selected_set_label:
+            st.session_state.active_set_label = selected_set_label
+            st.session_state.current_index = 0
+            st.session_state.answered = False
+            
+        # Run the 25-question loop
+        if st.session_state.current_index < len(current_set):
+            st.progress((st.session_state.current_index) / len(current_set))
+            q_data = current_set[st.session_state.current_index]
+            
+            st.subheader(f"Question {st.session_state.current_index + 1} of {len(current_set)}")
+            
+            # Formulate Question and Options based on Quiz Type
+            if quiz_type == "ows":
+                st.info(f"**Find the word for:**\n\n{q_data.get('english_meaning', 'No meaning found')}")
+                correct_ans = q_data['word_text']
+                pool = [w['word_text'] for w in all_words if w['word_text'] != correct_ans]
+                
             else:
-                st.warning("Please select an option first.")
+                st.info(f"**Find a synonym for:**\n\n### {q_data['word_text']}")
+                # Extract one synonym from the comma-separated string
+                syn_list = [s.strip() for s in q_data.get('synonyms', '').split(',') if s.strip()]
+                correct_ans = random.choice(syn_list) if syn_list and syn_list[0] != "No synonyms provided" else q_data.get('english_meaning', 'No synonym')
                 
-        if st.session_state.answered:
-            if st.button("Next Question ➡️"):
-                st.session_state.current_q, st.session_state.options = get_quiz_question()
+                # Get random wrong synonyms from other words
+                pool = []
+                for w in all_words:
+                    if w['word_text'] != q_data['word_text']:
+                        wrong_syns = [s.strip() for s in w.get('synonyms', '').split(',') if s.strip()]
+                        pool.extend(wrong_syns)
+            
+            # Generate 4 options (1 correct, 3 decoys)
+            if 'options_generated_for' not in st.session_state or st.session_state.options_generated_for != st.session_state.current_index:
+                decoys = random.sample(pool, min(len(pool), 3))
+                while len(decoys) < 3: decoys.append("None of the above")
+                
+                options = decoys + [correct_ans]
+                random.shuffle(options)
+                
+                st.session_state.current_options = options
+                st.session_state.correct_ans = correct_ans
+                st.session_state.options_generated_for = st.session_state.current_index
+
+            # Render the interactive red/green buttons
+            render_quiz_options(st.session_state.current_options, st.session_state.correct_ans, q_data['word_text'], quiz_type)
+
+        else:
+            st.success("🎉 You have completed this set of 25 questions!")
+            if st.button("🔄 Reattempt this Set"):
+                st.session_state.current_index = 0
                 st.session_state.answered = False
                 st.rerun()
-
-elif menu == "Progress Dashboard":
-    st.header("Your Mastery Metrics")
-    docs = db.collection("vocabulary_master").stream()
-    data = [doc.to_dict() for doc in docs]
-    
-    if data:
-        df = pd.DataFrame(data)
-        df['Success Rate (%)'] = (df['correct_attempts'] / df['total_attempts'].replace(0, 1)) * 100
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Words", len(df))
-        col2.metric("High Priority (#R > 2)", len(df[df['repeat_count'] > 2]))
-        col3.metric("Weak Words (< 50%)", len(df[(df['Success Rate (%)'] < 50) & (df['total_attempts'] > 0)]))
-        
-        st.dataframe(df[['word_text', 'category', 'repeat_count', 'Success Rate (%)']].sort_values(by='Success Rate (%)'))
-    else:
-
-        st.write("Database is empty.")
